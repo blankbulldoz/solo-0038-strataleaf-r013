@@ -16,16 +16,50 @@ class Page:
 
 
 def query_identity(value):
+    """Canonical form of a query value for cursor binding.
+
+    JSON types stay distinguishable: booleans are never folded into numbers
+    and arrays keep their order and duplicates (an array is an ordered body,
+    not a set). Object key order is irrelevant because dumps() sorts keys.
+    Floats that are integral keep comparing equal to integers, matching the
+    predicate equality and index token semantics.
+    """
     if isinstance(value, dict):
         return {key: query_identity(item) for key, item in value.items()}
     if isinstance(value, list):
-        items = {dumps(query_identity(item)) for item in value}
-        return [loads(item) for item in sorted(items)]
-    if isinstance(value, (bool, int)):
-        return int(value)
+        return [query_identity(item) for item in value]
+    if isinstance(value, bool):
+        return value
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value
+
+
+def predicate_identity(expression):
+    """Canonical fingerprint input for a (possibly nested) predicate.
+
+    Leaf values pass through query_identity, so bool/number and ordered-array
+    distinctions survive inside and/or/not combinations. The value container
+    of ``in`` is an unordered choice set: its entries are canonicalized and
+    deduplicated, so choice ordering and repeated choices do not invalidate a
+    continuation. Every other value container (including ``eq`` and
+    ``contains``) keeps exact structure, order and multiplicity.
+    """
+    if expression is None:
+        return None
+    if "and" in expression:
+        return {"and": [predicate_identity(item) for item in expression["and"]]}
+    if "or" in expression:
+        return {"or": [predicate_identity(item) for item in expression["or"]]}
+    if "not" in expression:
+        return {"not": predicate_identity(expression["not"])}
+    value = expression["value"]
+    if expression["op"] == "in":
+        choices = sorted({dumps(query_identity(choice)) for choice in value})
+        value = [loads(item) for item in choices]
+    else:
+        value = query_identity(value)
+    return {"field": expression["field"], "op": expression["op"], "value": value}
 
 
 class QueryEngine:
@@ -39,7 +73,7 @@ class QueryEngine:
         with self.store.read() as connection:
             if not connection.execute("SELECT 1 FROM collections WHERE name=?", (collection,)).fetchone():
                 raise NotFound("unknown collection")
-            fingerprint = digest({"collection": collection, "predicate": query_identity(predicate)})
+            fingerprint = digest({"collection": collection, "predicate": predicate_identity(predicate)})
             after = None
             if cursor is not None:
                 payload = decode_cursor(self.store, cursor)
